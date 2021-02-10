@@ -113,6 +113,17 @@ var dns_queue = [];
 function handleRequest(request, response) {
 	console.log('request from', request.address.address, 'for', request.question[0].name);
 
+	// If we're only to resolve local only, then if ANY of the questions are not for .local,
+	// forward them all to upstream.  There's probably a graceful way to handle a mixed scenario,
+	// but I'm not that graceful.
+	var use_upstream_only = false;
+	if(Config.local_only) {
+		request.question.forEach(function(question) {
+			if(!question.name.endsWith('.local'))
+				use_upstream_only = true;
+		});
+	}
+
 	// Build array of async functions for proxying
 	var f = [];
 	request.question.forEach(function(question) {
@@ -122,25 +133,35 @@ function handleRequest(request, response) {
 		});
 	});
 
-	// Push this question into our queue
-	request.question.forEach(function(question) {
-		dns_queue.push({
-			question: question,
-			response: response,
-			// A timer so we don't time out waiting on an mDNS response
-			timeout: setTimeout(function() {
-					console.log('timeout');
-					async.parallel(f, function() {
-						response.send();
-					});
-				}, Config.mdns_timeout)
+
+	// If we flagged to only resolve upstream, then only resolve upstream
+	if(use_upstream_only) {
+		async.parallel(f, function() {
+			response.send();
 		});
 
-		// Kick off the mDNS query
-		mdns.query(question.name, function() {
-			console.log('mdns query', question.name);
+	// Otherwise, let's run it by locally first
+	} else {
+		// Push this question into our queue
+		request.question.forEach(function(question) {
+			dns_queue.push({
+				question: question,
+				response: response,
+				// A timer so we don't time out waiting on an mDNS response
+				timeout: setTimeout(function() {
+						console.log('timeout');
+						async.parallel(f, function() {
+							response.send();
+						});
+					}, Config.mdns_timeout)
+			});
+
+			// Kick off the mDNS query
+			mdns.query(question.name, function() {
+				console.log('mdns query', question.name);
+			});
 		});
-	});
+	}
 }
 
 

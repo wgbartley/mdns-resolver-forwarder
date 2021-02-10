@@ -15,3 +15,4 @@ Edit `config.js`:
  - `authority_type` - The DNS query type to use (probably `udp` for most cases)
  - `authority_timeout` - Timeout to wait on the authority to respond
  - `mdns_timeout` - Time to wait for mDNS to response before forwarding the query to the authority/resolver
+ - `local_only` - Only listen for `*.local` domains.  Setting this to `true` will instantly forward any request that contains non-`.local` domains to the resolver (for faster response)
