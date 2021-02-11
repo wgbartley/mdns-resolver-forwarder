@@ -4,7 +4,9 @@
 var dns = require('native-dns');
 var async = require('async');
 var mdns = require('multicast-dns')();
-require('console-stamp')(console, {pattern: 'yyyy-mm-dd HH:MM:ss.l'});
+var uuid = require('uuid').v4;
+var NodeCache = require('node-cache');
+//require('console-stamp')(console, {pattern: 'yyyy-mm-dd HH:MM:ss.l'});
 
 // Local packages
 var Config = require('./config');
@@ -19,6 +21,9 @@ var authority = {
 	port: Config.authority_port,
 	type: Config.authority_type
 };
+
+// Cache
+var cache = new NodeCache();
 
 
 // DNS server events
@@ -54,18 +59,18 @@ mdns.on('response', function(packet, rinfo) {
 		return;
 
 	// Return early if the queue length is 0 (zero)
-	if(dns_queue.length==0)
+	if(queue.length==0)
 		return;
 
 	// Check the DNS queue if someone is waiting for a response
 	// Loop through the queue
-	for(var i=0; i<dns_queue.length; i++) {
-		var queue = dns_queue[i];
+	Object.keys(queue).forEach(function(id) {
+		var q = queue[id];
 
 		// Loop through answers to see if one can answer our question
 		packet.answers.forEach(function(answer) {
 			// Return early if this is not a match
-			if(answer.name.toLowerCase()!=queue.question.name.toLowerCase())
+			if(answer.name.toLowerCase()!=q.question.name.toLowerCase())
 				return;
 
 			// Format the answer response
@@ -87,31 +92,49 @@ mdns.on('response', function(packet, rinfo) {
 			}
 
 			// Prep the answer response
-			queue.response.answer.push(dns[answer.type](data));
+			q.response.answer.push(dns[answer.type](data));
+
+			if(Config.verbose_mdns) console.log('mdns answer', data.data || data.address);
 		});
 
 		// Skip this record if we don't have any answers
-		if(queue.response.answer.length==0)
-			continue;
+		if(q.response.answer.length==0) {
+			delete timers[id];
+			delete queue[id];
+			return;
+		}
+
+		// Store in the cache
+		cache.set(q.question.name.toLowerCase(), q.response.answer, q.response.answer[0].ttl*1000);
 
 		// If we've made it this far, we have answers!
-		// Clear timeouts to proxy
-		clearTimeout(queue.timeout);
-		clearTimeout(dns_queue[i].timeout);
+		// Clear timeout to proxy
+		clearTimeout(timers[id]);
+		delete timers[id];
 
 		// Send the response
-		queue.response.send();
+		q.response.send();
 
 		// Remove this item from the queue
-		dns_queue.splice(i, 1);
-	}
+		delete queue[id];
+	});
 });
 
 
 // Handle a DNS request
-var dns_queue = [];
+var queue = {};
+var timers = {};
 function handleRequest(request, response) {
+	var id = uuid();
 	console.log('request from', request.address.address, 'for', request.question[0].name);
+
+	// Check the cache
+	var cached_data = cache.get(request.question[0].name.toLowerCase());
+	if(typeof cached_data!='undefined') {
+		if(Config.verbose_cache) console.log('returned cached data for', request.question[0].name);
+		response.answer = cached_data;
+		return response.send();
+	}
 
 	// If we're only to resolve local only, then if ANY of the questions are not for .local,
 	// forward them all to upstream.  There's probably a graceful way to handle a mixed scenario,
@@ -144,21 +167,21 @@ function handleRequest(request, response) {
 	} else {
 		// Push this question into our queue
 		request.question.forEach(function(question) {
-			dns_queue.push({
+			queue[id] = {
 				question: question,
-				response: response,
-				// A timer so we don't time out waiting on an mDNS response
-				timeout: setTimeout(function() {
-						console.log('timeout');
-						async.parallel(f, function() {
-							response.send();
-						});
-					}, Config.mdns_timeout)
-			});
+				response: response
+			}
+
+			timers[id] = setTimeout(function() {
+				if(Config.verbose_mdns) console.log(`mdns timeout`, question.name);
+				async.parallel(f, function() {
+					response.send();
+				});
+			}, Config.mdns_timeout);
 
 			// Kick off the mDNS query
 			mdns.query(question.name, function() {
-				console.log('mdns query', question.name);
+				if(Config.verbose_mdns) console.log('mdns query', question.name);
 			});
 		});
 	}
@@ -167,7 +190,7 @@ function handleRequest(request, response) {
 
 // Proxy a DNS query
 function proxy(question, response, callback) {
-	console.log('proxying', question.name);
+	if(Config.verbose_proxy) console.log('proxying', question.name);
 
 	var request = dns.Request({
 		question: question,
@@ -177,11 +200,17 @@ function proxy(question, response, callback) {
 
 	request.on('message', function(err, msg) {
 		msg.answer.forEach(function(a) {
-			console.log('dns answer', a);
+			if(Config.verbose_proxy) console.log('dns answer', a);
 			response.answer.push(a);
 		});
+
+		if(response.answer.length>0)
+			cache.set(question.name.toLowerCase(), response.answer, response.answer[0].ttl*1000);
 	});
 
-	request.on('end', callback);
+	request.on('end', function() {
+		callback();
+	});
+
 	request.send();
 }
